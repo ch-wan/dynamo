@@ -164,9 +164,6 @@ func InjectCheckpointIntoPodSpec(
 		EnsurePodInfoMount(c)
 	}
 	if info.Ready && info.GPUMemoryService != nil && info.GPUMemoryService.Enabled {
-		if len(info.RestoreTargetContainers) > 0 {
-			return fmt.Errorf("gpuMemoryService checkpoint restore is not supported with multiple restore targets")
-		}
 		storage, err := snapshotprotocol.DiscoverAndResolveStorage(
 			ctx,
 			reader,
@@ -177,33 +174,16 @@ func InjectCheckpointIntoPodSpec(
 		if err != nil {
 			return err
 		}
-		info.GMSArtifactDir = ResolveGMSArtifactDir(storage)
+		gmsStorage, err := ResolveGMSCheckpointStorage(storage, info.GPUMemoryService)
+		if err != nil {
+			return err
+		}
+		info.GMSArtifactDir = gmsStorage.ControlDir
 		if info.GPUMemoryService.Mode == nvidiacomv1alpha1.GMSModeInterPod {
 			return nil
 		}
-		// GMS today is wired to a single main container. Multi-target
-		// (failover) support for GMS is tracked separately; stick to
-		// the legacy main-container path so single-engine GMS restore
-		// continues to work.
-		mainContainer := resolveMainContainer(podSpec)
-		if mainContainer == nil {
-			return fmt.Errorf("gpuMemoryService enabled but no container named %q found in pod spec", commonconsts.MainContainerName)
-		}
-		EnsureGMSRestoreSidecars(podSpec, mainContainer, storage)
+		EnsureGMSRestoreSidecars(podSpec, podInfoContainers, gmsStorage)
 	}
 
-	return nil
-}
-
-// resolveMainContainer finds the container named "main" in the pod spec.
-// ExtraPodSpec.PodSpec.Containers can inject user containers before the main
-// container (mergo merge happens before main is appended), so index 0 is
-// not guaranteed to be the main container here.
-func resolveMainContainer(podSpec *corev1.PodSpec) *corev1.Container {
-	for i := range podSpec.Containers {
-		if podSpec.Containers[i].Name == commonconsts.MainContainerName {
-			return &podSpec.Containers[i]
-		}
-	}
 	return nil
 }
