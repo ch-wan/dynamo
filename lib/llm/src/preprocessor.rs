@@ -1846,6 +1846,24 @@ mod tests {
             ),
             (Some("hermes"), None, false, "hermes → not required"),
             (
+                Some("harmony"),
+                None,
+                true,
+                "harmony tool-call only → required",
+            ),
+            (
+                None,
+                Some("gpt_oss"),
+                true,
+                "gpt_oss reasoning only → required",
+            ),
+            (
+                Some("harmony"),
+                Some("gpt_oss"),
+                true,
+                "harmony + gpt_oss paired → required",
+            ),
+            (
                 Some("kimi_k2"),
                 Some("kimi_k25"),
                 false,
