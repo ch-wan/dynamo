@@ -11,7 +11,7 @@ use crate::{
     discovery::EndpointInstanceId,
     dynamo_nvtx_range,
     engine::{AsyncEngine, AsyncEngineContext, Data},
-    metrics::frontend_perf::STAGE_DURATION_SECONDS,
+    metrics::frontend_perf::{STAGE_DURATION_SECONDS, STAGE_ROUTE},
     pipeline::{
         AddressedPushRouter, AddressedRequest, Error, ManyOut, SingleIn,
         error::{PipelineError, PipelineErrorExt},
@@ -136,10 +136,6 @@ where
     /// addresses it, then passes it to AddressedPushRouter which does the network traffic.
     addressed: Arc<AddressedPushRouter>,
 
-    /// Threshold for determining when a worker is busy (0.0 to 1.0)
-    /// If None, busy detection is disabled
-    busy_threshold: Option<f64>,
-
     /// When false, `generate_with_fault_detection` skips fault detection logic:
     /// it won't call `report_instance_down` on errors, and it uses the raw discovery
     /// instance list instead of the filtered avail list. Use for recovery/query paths
@@ -159,7 +155,8 @@ where
     _phantom: PhantomData<(T, U)>,
 }
 
-#[derive(Default, Debug, Clone, Copy, PartialEq)]
+#[derive(Default, Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RouterMode {
     #[default]
     RoundRobin,
@@ -400,9 +397,9 @@ where
     T: Data + Serialize,
     U: Data + for<'de> Deserialize<'de> + MaybeError,
 {
-    /// Create a new PushRouter without busy threshold (no busy detection)
+    /// Create a new PushRouter without a worker load monitor (no busy detection)
     pub async fn from_client(client: Client, router_mode: RouterMode) -> anyhow::Result<Self> {
-        Self::from_client_with_threshold(client, router_mode, None, None).await
+        Self::from_client_with_monitor(client, router_mode, None).await
     }
 
     /// Create a new PushRouter with fault detection disabled.
@@ -439,7 +436,6 @@ where
             addressed,
             router_mode,
             round_robin_counter: Arc::new(AtomicU64::new(0)),
-            busy_threshold: None,
             fault_detection_enabled: false,
             response_timeout: response_inactivity_timeout(),
             occupancy_state,
@@ -447,11 +443,15 @@ where
         })
     }
 
-    /// Create a new PushRouter with optional busy threshold and worker load monitor
-    pub async fn from_client_with_threshold(
+    /// Create a new PushRouter with an optional worker load monitor.
+    ///
+    /// The rejection path is gated by `fault_detection_enabled` (true here);
+    /// busy detection itself is driven by the monitor via `client.update_free_instances(...)`.
+    /// If no thresholds are configured on the monitor (or no monitor is provided),
+    /// `client.instance_ids_free()` returns all instances and the gate never rejects.
+    pub async fn from_client_with_monitor(
         client: Client,
         router_mode: RouterMode,
-        busy_threshold: Option<f64>,
         worker_monitor: Option<Arc<dyn WorkerLoadMonitor>>,
     ) -> anyhow::Result<Self> {
         let addressed = addressed_router(&client.endpoint).await?;
@@ -484,7 +484,6 @@ where
             addressed,
             router_mode,
             round_robin_counter: Arc::new(AtomicU64::new(0)),
-            busy_threshold,
             fault_detection_enabled: true,
             response_timeout: response_inactivity_timeout(),
             occupancy_state,
@@ -807,8 +806,8 @@ where
             )
         };
 
-        // Check if all workers are busy (only if busy threshold is set and fault detection enabled)
-        if self.fault_detection_enabled && self.busy_threshold.is_some() {
+        // Check if all workers are busy (when fault detection is enabled).
+        if self.fault_detection_enabled {
             let free_instances = self.client.instance_ids_free();
             if free_instances.is_empty() {
                 // Check if we actually have any instances at all
@@ -911,7 +910,7 @@ where
         let request = request.map(|req| AddressedRequest::with_instance(req, address, instance));
 
         STAGE_DURATION_SECONDS
-            .with_label_values(&["route"])
+            .with_label_values(&[STAGE_ROUTE])
             .observe(route_start.elapsed().as_secs_f64());
 
         let _nvtx_transport = dynamo_nvtx_range!(_transport_kind);
