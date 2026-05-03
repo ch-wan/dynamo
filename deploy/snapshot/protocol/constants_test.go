@@ -14,19 +14,22 @@ func TestApplyRestoreTargetMetadata(t *testing.T) {
 		CheckpointIDLabel:     "old",
 	}
 	annotations := map[string]string{
-		CheckpointArtifactVersionAnnotation:         "old",
-		CheckpointStatusAnnotation:                  "completed",
-		RestoreStatusAnnotationFor("main"):          "failed",
-		RestoreStatusAnnotationFor("engine-1"):      "completed",
-		RestoreContainerIDAnnotationFor("main"):     "dead-container",
-		RestoreContainerIDAnnotationFor("engine-1"): "dead-container",
-		"nvidia.com/snapshot-restore-status":        "completed",
-		"nvidia.com/snapshot-restore-container-id":  "dead-container",
+		CheckpointArtifactVersionAnnotation:          "old",
+		CheckpointStatusAnnotation:                   "completed",
+		RestoreStatusAnnotationFor("main"):           "failed",
+		RestoreStatusAnnotationFor("engine-1"):       "completed",
+		RestoreContainerIDAnnotationFor("main"):      "dead-container",
+		RestoreContainerIDAnnotationFor("engine-1"):  "dead-container",
+		RestoreModeAnnotation:                        RestoreModeManual,
+		RestoreTriggerAnnotation:                     "stale-trigger",
+		RestoreProcessedTriggerAnnotationFor("main"): "stale-trigger",
+		"nvidia.com/snapshot-restore-status":         "completed",
+		"nvidia.com/snapshot-restore-container-id":   "dead-container",
 		// Preserve the target-containers annotation across ApplyRestoreTargetMetadata.
 		TargetContainersAnnotation: "main",
 	}
 
-	ApplyRestoreTargetMetadata(labels, annotations, true, "hash", "2")
+	ApplyRestoreTargetMetadata(labels, annotations, true, true, "hash", "2")
 
 	if labels[CheckpointIDLabel] != "hash" {
 		t.Fatalf("expected checkpoint hash label, got %#v", labels)
@@ -45,6 +48,8 @@ func TestApplyRestoreTargetMetadata(t *testing.T) {
 		RestoreStatusAnnotationFor("engine-1"),
 		RestoreContainerIDAnnotationFor("main"),
 		RestoreContainerIDAnnotationFor("engine-1"),
+		RestoreTriggerAnnotation,
+		RestoreProcessedTriggerAnnotationFor("main"),
 		"nvidia.com/snapshot-restore-status",
 		"nvidia.com/snapshot-restore-container-id",
 	} {
@@ -55,6 +60,9 @@ func TestApplyRestoreTargetMetadata(t *testing.T) {
 	if got := annotations[TargetContainersAnnotation]; got != "main" {
 		t.Fatalf("target-containers annotation must be preserved, got %q", got)
 	}
+	if got := annotations[RestoreModeAnnotation]; got != RestoreModeManual {
+		t.Fatalf("expected manual restore mode, got %q", got)
+	}
 }
 
 func TestApplyRestoreTargetMetadataDisabledClearsState(t *testing.T) {
@@ -62,13 +70,16 @@ func TestApplyRestoreTargetMetadataDisabledClearsState(t *testing.T) {
 		CheckpointIDLabel: "hash",
 	}
 	annotations := map[string]string{
-		CheckpointArtifactVersionAnnotation:     "2",
-		CheckpointStatusAnnotation:              "completed",
-		RestoreStatusAnnotationFor("main"):      "failed",
-		RestoreContainerIDAnnotationFor("main"): "dead-container",
+		CheckpointArtifactVersionAnnotation:          "2",
+		CheckpointStatusAnnotation:                   "completed",
+		RestoreStatusAnnotationFor("main"):           "failed",
+		RestoreContainerIDAnnotationFor("main"):      "dead-container",
+		RestoreModeAnnotation:                        RestoreModeManual,
+		RestoreTriggerAnnotation:                     "stale-trigger",
+		RestoreProcessedTriggerAnnotationFor("main"): "stale-trigger",
 	}
 
-	ApplyRestoreTargetMetadata(labels, annotations, false, "", "")
+	ApplyRestoreTargetMetadata(labels, annotations, false, false, "", "")
 
 	if _, ok := labels[CheckpointIDLabel]; ok {
 		t.Fatalf("checkpoint hash label was not cleared: %#v", labels)
@@ -84,6 +95,15 @@ func TestApplyRestoreTargetMetadataDisabledClearsState(t *testing.T) {
 	}
 	if _, ok := annotations[RestoreContainerIDAnnotationFor("main")]; ok {
 		t.Fatalf("per-container restore container id was not cleared: %#v", annotations)
+	}
+	if _, ok := annotations[RestoreModeAnnotation]; ok {
+		t.Fatalf("restore mode was not cleared: %#v", annotations)
+	}
+	if _, ok := annotations[RestoreTriggerAnnotation]; ok {
+		t.Fatalf("restore trigger was not cleared: %#v", annotations)
+	}
+	if _, ok := annotations[RestoreProcessedTriggerAnnotationFor("main")]; ok {
+		t.Fatalf("processed restore trigger was not cleared: %#v", annotations)
 	}
 }
 

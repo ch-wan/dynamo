@@ -55,6 +55,12 @@ const (
 	// both user-facing paths (DynamoCheckpoint Jobs and DGD restore pods).
 	TargetContainersAnnotation = "nvidia.com/snapshot-target-containers"
 
+	// RestoreModeAnnotation opts a restore target into benchmark-controlled
+	// restore triggering. The default path ignores RestoreTriggerAnnotation.
+	RestoreModeAnnotation    = "nvidia.com/snapshot-restore-mode"
+	RestoreModeManual        = "manual"
+	RestoreTriggerAnnotation = "nvidia.com/snapshot-restore-trigger"
+
 	// CheckpointStatusAnnotation is written by snapshot-agent on the
 	// checkpoint Job once the (single) target container's checkpoint either
 	// completes or fails. Watched by the operator and snapshotctl.
@@ -71,6 +77,11 @@ const (
 	// across kubelet container restarts. Full key is
 	// "nvidia.com/snapshot-restore-container-id.<containerName>".
 	RestoreContainerIDAnnotationPrefix = "nvidia.com/snapshot-restore-container-id."
+
+	// RestoreProcessedTriggerAnnotationPrefix stores the last consumed manual
+	// trigger per target container so a pod restart does not replay the same
+	// benchmark trigger unless the harness writes a fresh token.
+	RestoreProcessedTriggerAnnotationPrefix = "nvidia.com/snapshot-restore-processed-trigger."
 
 	CheckpointVolumeName             = "checkpoint-storage"
 	DefaultCheckpointArtifactVersion = "1"
@@ -148,6 +159,10 @@ func RestoreContainerIDAnnotationFor(containerName string) string {
 	return RestoreContainerIDAnnotationPrefix + containerName
 }
 
+func RestoreProcessedTriggerAnnotationFor(containerName string) string {
+	return RestoreProcessedTriggerAnnotationPrefix + containerName
+}
+
 // FormatTargetContainers renders a target-container list into the canonical
 // comma-separated annotation value. Whitespace is trimmed, empty names are
 // dropped, and duplicates are preserved in input order (callers are
@@ -220,7 +235,8 @@ func clearRestoreStatusKeys(annotations map[string]string) {
 	delete(annotations, "nvidia.com/snapshot-restore-container-id")
 	for key := range annotations {
 		if strings.HasPrefix(key, RestoreStatusAnnotationPrefix) ||
-			strings.HasPrefix(key, RestoreContainerIDAnnotationPrefix) {
+			strings.HasPrefix(key, RestoreContainerIDAnnotationPrefix) ||
+			strings.HasPrefix(key, RestoreProcessedTriggerAnnotationPrefix) {
 			delete(annotations, key)
 		}
 	}
@@ -235,11 +251,13 @@ func clearRestoreStatusKeys(annotations map[string]string) {
 // it based on failover vs non-failover intent, snapshotctl stamps it from
 // --containers, etc. This helper never touches it so callers can set it
 // before or after with no ordering surprise.
-func ApplyRestoreTargetMetadata(labels map[string]string, annotations map[string]string, enabled bool, checkpointID string, artifactVersion string) {
+func ApplyRestoreTargetMetadata(labels map[string]string, annotations map[string]string, enabled bool, manualTrigger bool, checkpointID string, artifactVersion string) {
 	delete(labels, CheckpointSourceLabel)
 	delete(labels, CheckpointIDLabel)
 	delete(annotations, CheckpointArtifactVersionAnnotation)
 	delete(annotations, CheckpointStatusAnnotation)
+	delete(annotations, RestoreModeAnnotation)
+	delete(annotations, RestoreTriggerAnnotation)
 	clearRestoreStatusKeys(annotations)
 
 	if !enabled {
@@ -250,6 +268,9 @@ func ApplyRestoreTargetMetadata(labels map[string]string, annotations map[string
 		labels[CheckpointIDLabel] = checkpointID
 	}
 	annotations[CheckpointArtifactVersionAnnotation] = ArtifactVersion(artifactVersion)
+	if manualTrigger {
+		annotations[RestoreModeAnnotation] = RestoreModeManual
+	}
 }
 
 func applyCheckpointSourceMetadata(labels map[string]string, annotations map[string]string, checkpointID string, artifactVersion string) {
