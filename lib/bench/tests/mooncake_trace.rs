@@ -15,29 +15,52 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+#[cfg(feature = "mocker-kvbm-offload")]
+use common::generate_g2_replay_artifacts_with_capacity;
 use common::{WorkerReplayArtifacts, generate_replay_artifacts, process_mooncake_trace};
+#[cfg(feature = "mocker-kvbm-offload")]
+use dynamo_kv_router::ConcurrentRadixTreeCompressed;
 use dynamo_kv_router::LocalBlockHash;
 use dynamo_kv_router::indexer::pruning::PruneConfig;
+#[cfg(feature = "mocker-kvbm-offload")]
+use dynamo_kv_router::indexer::{
+    KvIndexer, LowerTierContinuation, LowerTierIndexer, MatchDetails, ThreadPoolIndexer,
+};
 use dynamo_kv_router::indexer::{KvIndexerInterface, KvIndexerMetrics};
-use dynamo_kv_router::protocols::{KvCacheEvent, RouterEvent, TokensWithHashes, WorkerWithDpRank};
+#[cfg(feature = "mocker-kvbm-offload")]
+use dynamo_kv_router::protocols::KvCacheEventData;
+use dynamo_kv_router::protocols::{
+    KvCacheEvent, RouterEvent, StorageTier, TokensWithHashes, WorkerWithDpRank,
+};
 use dynamo_mocker::loadgen::{SessionTrace, Trace, TurnTrace};
 use mooncake_shared::{
     MooncakeBenchmarkConfig, MooncakeBenchmarkInput, MooncakeIndexerConfig, run_benchmark,
 };
+#[cfg(feature = "mocker-kvbm-offload")]
+use rustc_hash::FxHashMap;
 use tempfile::NamedTempFile;
+#[cfg(feature = "mocker-kvbm-offload")]
+use tokio_util::sync::CancellationToken;
 
 const BLOCK_SIZE: u32 = 128;
 const NUM_GPU_BLOCKS: usize = 16384;
 const NUM_UNIQUE_INFERENCE_WORKERS: usize = 10;
 const BENCHMARK_DURATION_MS: u64 = 2000;
 const NUM_EVENT_WORKERS: usize = 4;
+#[cfg(feature = "mocker-kvbm-offload")]
+const G2_TEST_NUM_GPU_BLOCKS: usize = 512;
+#[cfg(feature = "mocker-kvbm-offload")]
+const G2_TEST_NUM_G2_BLOCKS: usize = 16_384;
 
 type NormalizedOverlapScores = BTreeMap<WorkerWithDpRank, u32>;
 
 #[derive(Clone)]
 enum ReplayEntryKind {
     Request(Vec<LocalBlockHash>),
-    Event(KvCacheEvent),
+    Event {
+        event: KvCacheEvent,
+        storage_tier: StorageTier,
+    },
     ApproxWrite(Vec<u32>),
 }
 
@@ -62,7 +85,10 @@ fn collect_replay_entries(artifacts: &[WorkerReplayArtifacts]) -> Vec<ReplayEntr
             timestamp_us: event.timestamp_us,
             worker_id: worker_id as u64,
             kind_rank: 1,
-            kind: ReplayEntryKind::Event(event.event.clone()),
+            kind: ReplayEntryKind::Event {
+                event: event.event.clone(),
+                storage_tier: event.storage_tier,
+            },
         }));
     }
     entries.sort_by_key(|entry| (entry.timestamp_us, entry.kind_rank, entry.worker_id));
@@ -156,10 +182,19 @@ async fn collect_overlap_scores_for_replay(
                     let overlap = indexer.find_matches(request.clone()).await?;
                     scores.push(overlap.scores.into_iter().collect());
                 }
-                ReplayEntryKind::Event(event) => {
-                    indexer
-                        .apply_event(RouterEvent::new(entries[idx].worker_id, event.clone()))
-                        .await;
+                ReplayEntryKind::Event {
+                    event,
+                    storage_tier,
+                } => {
+                    if storage_tier.is_gpu() {
+                        indexer
+                            .apply_event(RouterEvent::with_storage_tier(
+                                entries[idx].worker_id,
+                                event.clone(),
+                                *storage_tier,
+                            ))
+                            .await;
+                    }
                 }
                 ReplayEntryKind::ApproxWrite(tokens) => {
                     let mut tokens_with_hashes = TokensWithHashes::new(tokens.clone(), BLOCK_SIZE);
@@ -282,6 +317,301 @@ async fn route_approx_writes(
     }
 
     Ok(())
+}
+
+#[cfg(feature = "mocker-kvbm-offload")]
+#[derive(Clone, Copy, Debug, Default)]
+struct HostPinnedEventCounts {
+    stored: usize,
+    removed: usize,
+}
+
+#[cfg(feature = "mocker-kvbm-offload")]
+fn count_host_pinned_events(artifacts: &[WorkerReplayArtifacts]) -> HostPinnedEventCounts {
+    let mut counts = HostPinnedEventCounts::default();
+    for event in artifacts
+        .iter()
+        .flat_map(|artifact| artifact.kv_events.iter())
+        .filter(|event| event.storage_tier == StorageTier::HostPinned)
+    {
+        match &event.event.data {
+            KvCacheEventData::Stored(_) => counts.stored += 1,
+            KvCacheEventData::Removed(_) => counts.removed += 1,
+            KvCacheEventData::Cleared => {}
+        }
+    }
+    counts
+}
+
+#[cfg(feature = "mocker-kvbm-offload")]
+fn additive_device_and_host_pinned_scores(
+    device_details: MatchDetails,
+    request: &[LocalBlockHash],
+    host_pinned: &LowerTierIndexer,
+) -> NormalizedOverlapScores {
+    let mut scores = device_details.overlap_scores.scores;
+    let mut continuations = FxHashMap::default();
+
+    for (worker, device_blocks) in &scores {
+        let Some(last_hash) = device_details.last_matched_hashes.get(worker) else {
+            continue;
+        };
+        let start_pos = *device_blocks as usize;
+        if start_pos < request.len() {
+            continuations.insert(*worker, LowerTierContinuation::new(start_pos, *last_hash));
+        }
+    }
+
+    if let Some(first_hash) = request.first() {
+        for worker in host_pinned.root_workers(*first_hash) {
+            continuations
+                .entry(worker)
+                .or_insert_with(|| LowerTierContinuation::from_root(0));
+        }
+    }
+
+    for (worker, host_blocks) in host_pinned.query_contiguous_hits(request, &continuations) {
+        if host_blocks == 0 {
+            continue;
+        }
+        let host_blocks = u32::try_from(host_blocks).unwrap_or(u32::MAX);
+        scores
+            .entry(worker)
+            .and_modify(|score| *score = score.saturating_add(host_blocks))
+            .or_insert(host_blocks);
+    }
+
+    scores.into_iter().filter(|(_, score)| *score > 0).collect()
+}
+
+#[cfg(feature = "mocker-kvbm-offload")]
+struct ReferenceTieredReplay {
+    primary: KvIndexer,
+    host_pinned: ThreadPoolIndexer<LowerTierIndexer>,
+}
+
+#[cfg(feature = "mocker-kvbm-offload")]
+impl ReferenceTieredReplay {
+    fn new() -> Self {
+        Self {
+            primary: KvIndexer::new(
+                CancellationToken::new(),
+                BLOCK_SIZE,
+                Arc::new(KvIndexerMetrics::new_unregistered()),
+            ),
+            host_pinned: ThreadPoolIndexer::new(
+                LowerTierIndexer::new(),
+                NUM_EVENT_WORKERS,
+                BLOCK_SIZE,
+            ),
+        }
+    }
+
+    async fn apply_event(&self, worker_id: u64, event: KvCacheEvent, storage_tier: StorageTier) {
+        if matches!(&event.data, KvCacheEventData::Cleared) {
+            self.primary
+                .apply_event(RouterEvent::with_storage_tier(
+                    worker_id,
+                    event.clone(),
+                    StorageTier::Device,
+                ))
+                .await;
+            self.host_pinned
+                .apply_event(RouterEvent::with_storage_tier(
+                    worker_id,
+                    event,
+                    StorageTier::HostPinned,
+                ))
+                .await;
+            return;
+        }
+
+        match storage_tier {
+            StorageTier::Device => {
+                self.primary
+                    .apply_event(RouterEvent::with_storage_tier(
+                        worker_id,
+                        event,
+                        storage_tier,
+                    ))
+                    .await;
+            }
+            StorageTier::HostPinned => {
+                self.host_pinned
+                    .apply_event(RouterEvent::with_storage_tier(
+                        worker_id,
+                        event,
+                        storage_tier,
+                    ))
+                    .await;
+            }
+            StorageTier::Disk | StorageTier::External => {}
+        }
+    }
+
+    async fn find_matches(
+        &self,
+        request: &[LocalBlockHash],
+    ) -> anyhow::Result<NormalizedOverlapScores> {
+        let details = self.primary.find_match_details(request.to_vec()).await?;
+        Ok(additive_device_and_host_pinned_scores(
+            details,
+            request,
+            self.host_pinned.backend(),
+        ))
+    }
+
+    async fn flush(&self) {
+        let _ = self.primary.flush().await;
+        self.host_pinned.flush().await;
+    }
+
+    fn shutdown(&self) {
+        self.primary.shutdown();
+        self.host_pinned.shutdown();
+    }
+}
+
+#[cfg(feature = "mocker-kvbm-offload")]
+struct CrtcLowerTierReplay {
+    primary: ThreadPoolIndexer<ConcurrentRadixTreeCompressed>,
+    host_pinned: ThreadPoolIndexer<LowerTierIndexer>,
+}
+
+#[cfg(feature = "mocker-kvbm-offload")]
+impl CrtcLowerTierReplay {
+    fn new() -> Self {
+        Self {
+            primary: ThreadPoolIndexer::new_with_metrics(
+                ConcurrentRadixTreeCompressed::new(),
+                NUM_EVENT_WORKERS,
+                BLOCK_SIZE,
+                Some(Arc::new(KvIndexerMetrics::new_unregistered())),
+            ),
+            host_pinned: ThreadPoolIndexer::new(
+                LowerTierIndexer::new(),
+                NUM_EVENT_WORKERS,
+                BLOCK_SIZE,
+            ),
+        }
+    }
+
+    async fn apply_event(&self, worker_id: u64, event: KvCacheEvent, storage_tier: StorageTier) {
+        if matches!(&event.data, KvCacheEventData::Cleared) {
+            self.primary
+                .apply_event(RouterEvent::with_storage_tier(
+                    worker_id,
+                    event.clone(),
+                    StorageTier::Device,
+                ))
+                .await;
+            self.host_pinned
+                .apply_event(RouterEvent::with_storage_tier(
+                    worker_id,
+                    event,
+                    StorageTier::HostPinned,
+                ))
+                .await;
+            return;
+        }
+
+        match storage_tier {
+            StorageTier::Device => {
+                self.primary
+                    .apply_event(RouterEvent::with_storage_tier(
+                        worker_id,
+                        event,
+                        storage_tier,
+                    ))
+                    .await;
+            }
+            StorageTier::HostPinned => {
+                self.host_pinned
+                    .apply_event(RouterEvent::with_storage_tier(
+                        worker_id,
+                        event,
+                        storage_tier,
+                    ))
+                    .await;
+            }
+            StorageTier::Disk | StorageTier::External => {}
+        }
+    }
+
+    fn find_matches(&self, request: &[LocalBlockHash]) -> NormalizedOverlapScores {
+        let details = self
+            .primary
+            .backend()
+            .find_match_details_impl(request, false);
+        additive_device_and_host_pinned_scores(details, request, self.host_pinned.backend())
+    }
+
+    async fn flush(&self) {
+        self.primary.flush().await;
+        self.host_pinned.flush().await;
+    }
+
+    fn shutdown(&self) {
+        self.primary.shutdown();
+        self.host_pinned.shutdown();
+    }
+}
+
+#[cfg(feature = "mocker-kvbm-offload")]
+async fn collect_tiered_replay_scores(
+    artifacts: &[WorkerReplayArtifacts],
+) -> anyhow::Result<(
+    Vec<NormalizedOverlapScores>,
+    Vec<NormalizedOverlapScores>,
+    usize,
+)> {
+    let reference = ReferenceTieredReplay::new();
+    let crtc_lower_tier = CrtcLowerTierReplay::new();
+    let entries = collect_replay_entries(artifacts);
+    let mut reference_scores = Vec::new();
+    let mut crtc_scores = Vec::new();
+    let mut idx = 0;
+
+    while idx < entries.len() {
+        let timestamp_us = entries[idx].timestamp_us;
+        while idx < entries.len() && entries[idx].timestamp_us == timestamp_us {
+            match &entries[idx].kind {
+                ReplayEntryKind::Request(request) => {
+                    reference_scores.push(reference.find_matches(request).await?);
+                    crtc_scores.push(crtc_lower_tier.find_matches(request));
+                }
+                ReplayEntryKind::Event {
+                    event,
+                    storage_tier,
+                } => {
+                    reference
+                        .apply_event(entries[idx].worker_id, event.clone(), *storage_tier)
+                        .await;
+                    crtc_lower_tier
+                        .apply_event(entries[idx].worker_id, event.clone(), *storage_tier)
+                        .await;
+                }
+                ReplayEntryKind::ApproxWrite(_) => {
+                    anyhow::bail!("approximate writes are not part of KV-event replay artifacts")
+                }
+            }
+            idx += 1;
+        }
+        reference.flush().await;
+        crtc_lower_tier.flush().await;
+    }
+
+    crtc_lower_tier.flush().await;
+    let host_pinned_events = crtc_lower_tier.host_pinned.dump_events().await?.len();
+    reference.shutdown();
+    crtc_lower_tier.shutdown();
+
+    Ok((reference_scores, crtc_scores, host_pinned_events))
+}
+
+#[cfg(feature = "mocker-kvbm-offload")]
+fn score_sum(scores: &NormalizedOverlapScores) -> u64 {
+    scores.values().map(|score| u64::from(*score)).sum()
 }
 
 #[test]
@@ -517,6 +847,79 @@ async fn mooncake_trace_replays_without_warnings_across_indexer_variants() -> an
     }
 
     assert_overlap_score_parity(&variants, &traces, &artifacts).await?;
+
+    Ok(())
+}
+
+#[cfg(feature = "mocker-kvbm-offload")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mooncake_trace_g2_events_replay_through_host_pinned_lower_tier() -> anyhow::Result<()> {
+    let warning_count = support::warning_counter(&["dynamo_kv_router::indexer", "dynamo_mocker"]);
+    support::reset_warning_count(&warning_count);
+
+    let fixture = support::fixture_path("mooncake_trace_1000.jsonl")?;
+    let traces = process_mooncake_trace(&fixture, BLOCK_SIZE, 1, 1, 1, 42)?;
+    let artifacts = generate_g2_replay_artifacts_with_capacity(
+        &traces,
+        G2_TEST_NUM_GPU_BLOCKS,
+        G2_TEST_NUM_G2_BLOCKS,
+        BLOCK_SIZE,
+        None,
+    )
+    .await?;
+    let counts = count_host_pinned_events(&artifacts);
+
+    assert!(
+        counts.stored > 0,
+        "mooncake G2 artifact generation should capture HostPinned Stored events; counts={counts:?}"
+    );
+    let (reference_scores, crtc_scores, host_pinned_dumped_events) =
+        collect_tiered_replay_scores(&artifacts).await?;
+    let device_only_scores = collect_overlap_scores_for_replay(
+        &MooncakeIndexerConfig::concurrent_radix_tree_compressed(NUM_EVENT_WORKERS),
+        &traces,
+        &artifacts,
+        MooncakeReplayMode::KvEvents,
+    )
+    .await?;
+
+    assert!(
+        host_pinned_dumped_events > 0,
+        "HostPinned lower-tier indexer should retain replayed G2 state"
+    );
+    assert_eq!(
+        crtc_scores.len(),
+        reference_scores.len(),
+        "CRTC lower-tier replay produced a different request count than the reference replay"
+    );
+    assert_eq!(
+        crtc_scores.len(),
+        device_only_scores.len(),
+        "tiered replay produced a different request count than device-only replay"
+    );
+    assert!(
+        crtc_scores
+            .iter()
+            .zip(device_only_scores.iter())
+            .any(|(tiered, device_only)| score_sum(tiered) > score_sum(device_only)),
+        "HostPinned lower-tier replay should improve at least one mooncake request over device-only replay"
+    );
+
+    for (request_idx, (actual, expected)) in
+        crtc_scores.iter().zip(reference_scores.iter()).enumerate()
+    {
+        assert_eq!(
+            actual, expected,
+            "CRTC lower-tier additive overlap diverged from reference at replay request {request_idx}"
+        );
+    }
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        warning_count.load(Ordering::Relaxed),
+        0,
+        "G2 HostPinned lower-tier replay emitted warn/error logs from dynamo_kv_router::indexer or dynamo_mocker"
+    );
 
     Ok(())
 }

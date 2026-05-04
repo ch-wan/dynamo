@@ -10,7 +10,7 @@ use dynamo_kv_router::LocalBlockHash;
 use dynamo_kv_router::indexer::pruning::PruneConfig;
 use dynamo_kv_router::indexer::{KvIndexer, KvIndexerInterface, KvIndexerMetrics};
 use dynamo_kv_router::protocols::{
-    KvCacheEvent, KvCacheEventData, RouterEvent, TokensWithHashes, WorkerWithDpRank,
+    KvCacheEvent, KvCacheEventData, RouterEvent, StorageTier, TokensWithHashes, WorkerWithDpRank,
 };
 use dynamo_kv_router::{
     AnchorAwareBranchShardedIndexer, BranchShardedIndexer, ConcurrentRadixTree,
@@ -313,8 +313,14 @@ pub struct MooncakeBenchmarkConfig {
 #[derive(Clone)]
 enum WorkerTraceEntry {
     Request(Vec<LocalBlockHash>),
-    Event(KvCacheEvent),
-    ApproxWrite { tokens: Vec<u32>, num_blocks: usize },
+    Event {
+        event: KvCacheEvent,
+        storage_tier: StorageTier,
+    },
+    ApproxWrite {
+        tokens: Vec<u32>,
+        num_blocks: usize,
+    },
 }
 
 /// A timestamped entry in a worker's benchmark trace, used to replay requests
@@ -347,7 +353,10 @@ fn prepare_event_worker_traces(
                 })
                 .chain(artifact.kv_events.into_iter().map(|event| WorkerTrace {
                     timestamp_us: event.timestamp_us,
-                    entry: WorkerTraceEntry::Event(event.event),
+                    entry: WorkerTraceEntry::Event {
+                        event: event.event,
+                        storage_tier: event.storage_tier,
+                    },
                 }))
                 .collect::<Vec<_>>();
             merged.sort_by_key(|entry| entry.timestamp_us);
@@ -476,10 +485,19 @@ pub async fn run_benchmark(
                                 Some(start.elapsed().as_nanos() as u64),
                             )
                         }
-                        WorkerTraceEntry::Event(event) => {
-                            indexer
-                                .apply_event(RouterEvent::new(worker_id as u64, event))
-                                .await;
+                        WorkerTraceEntry::Event {
+                            event,
+                            storage_tier,
+                        } => {
+                            if storage_tier.is_gpu() {
+                                indexer
+                                    .apply_event(RouterEvent::with_storage_tier(
+                                        worker_id as u64,
+                                        event,
+                                        storage_tier,
+                                    ))
+                                    .await;
+                            }
                             Ok(None)
                         }
                         WorkerTraceEntry::ApproxWrite { tokens, .. } => {
@@ -551,7 +569,7 @@ pub async fn run_benchmark(
                 .flat_map(|trace| trace.iter())
                 .filter_map(|entry| match &entry.entry {
                     WorkerTraceEntry::Request(hashes) => Some(hashes.clone()),
-                    WorkerTraceEntry::Event(_) | WorkerTraceEntry::ApproxWrite { .. } => None,
+                    WorkerTraceEntry::Event { .. } | WorkerTraceEntry::ApproxWrite { .. } => None,
                 })
                 .collect(),
         );
@@ -595,7 +613,7 @@ pub async fn run_benchmark(
         .map(|trace| {
             trace
                 .iter()
-                .filter(|entry| matches!(entry.entry, WorkerTraceEntry::Event(_)))
+                .filter(|entry| matches!(entry.entry, WorkerTraceEntry::Event { .. }))
                 .count()
         })
         .sum::<usize>()
@@ -621,7 +639,7 @@ pub async fn run_benchmark(
         .flat_map(|trace| trace.iter())
         .filter_map(|entry| match &entry.entry {
             WorkerTraceEntry::Request(hashes) => Some(hashes.len()),
-            WorkerTraceEntry::Event(_) | WorkerTraceEntry::ApproxWrite { .. } => None,
+            WorkerTraceEntry::Event { .. } | WorkerTraceEntry::ApproxWrite { .. } => None,
         })
         .sum::<usize>()
         * config.inference_worker_duplication_factor;
@@ -630,7 +648,7 @@ pub async fn run_benchmark(
         .iter()
         .flat_map(|trace| trace.iter())
         .filter_map(|entry| match &entry.entry {
-            WorkerTraceEntry::Event(event) => match &event.data {
+            WorkerTraceEntry::Event { event, .. } => match &event.data {
                 KvCacheEventData::Stored(store) => Some(store.blocks.len()),
                 _ => Some(0),
             },

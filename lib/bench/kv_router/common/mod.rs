@@ -22,9 +22,12 @@ use uuid::Uuid;
 
 pub use shared::{
     BenchmarkResults, BenchmarkRun, NoopSequencePublisher, WorkerReplayArtifacts,
-    compute_benchmark_run, default_mock_engine_args, generate_replay_artifacts, make_progress_bar,
-    process_mooncake_trace, rescale_trace_timestamps,
+    compute_benchmark_run, default_mock_engine_args, generate_replay_artifacts,
+    generate_replay_artifacts_with_args, make_progress_bar, process_mooncake_trace,
+    rescale_trace_timestamps,
 };
+#[cfg(feature = "mocker-kvbm-offload")]
+pub use shared::{g2_mock_engine_args, generate_g2_replay_artifacts_with_capacity};
 
 /// Shared CLI arguments for trace-based benchmarks.
 #[derive(clap::Args, Debug)]
